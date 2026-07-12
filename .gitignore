@@ -1,0 +1,11 @@
+# build output
+ZoneMax.exe
+
+# runtime state (machine-specific)
+zonemax.ini
+zonemax.log
+zonemax.log.old
+
+# machine-specific helper scripts / logs
+stop-displayfusion.ps1
+stop-displayfusion.log
