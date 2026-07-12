@@ -93,6 +93,9 @@ namespace ZoneMax
         public const int WM_MOUSEMOVE = 0x0200;
         public const int WM_LBUTTONDOWN = 0x0201;
         public const int WM_LBUTTONUP = 0x0202;
+        public const int WM_RBUTTONDOWN = 0x0204;
+        public const int WM_MBUTTONDOWN = 0x0207;
+        public const int WM_XBUTTONDOWN = 0x020B;
         public const int WM_KEYDOWN = 0x0100;
         public const int WM_SYSKEYDOWN = 0x0104;
         public const int WM_NCHITTEST = 0x0084;
@@ -996,6 +999,34 @@ namespace ZoneMax
             if (Cfg.Verbose) App.Log("     DISARM workarea -> " + back);
         }
 
+        // ---- mid-drag native-Snap suppression --------------------------------------
+        // Snap must be ON globally ("drag a maximized window to un-maximize it" IS Snap), but once
+        // a drag is under way and the window has already restored, native edge-snap is pure
+        // competition: drop at the left screen edge and Windows half-snaps the window -- preview
+        // overlay and all -- an instant before HandleDrop maximizes it into the zone. A visible
+        // fight on every edge drop. So: drag running + window restored -> Snap OFF for the rest of
+        // the drag; drop (or drag end seen by the watchdog) -> Snap back ON. Startup and the
+        // watchdog both re-enable it, so a crash mid-drag cannot leave Snap off.
+        static volatile bool snapSuppressed = false;
+        public static bool SnapSuppressed { get { return snapSuppressed; } }
+
+        public static void SuppressSnapForDrag(IntPtr hwnd)
+        {
+            if (snapSuppressed || !Dragging) return;
+            if (N.IsZoomed(hwnd)) return;    // restore hasn't happened yet -- Snap still has a job to do
+            N.SpiPtr(N.SPI_SETWINARRANGING, 0, IntPtr.Zero, N.SPIF_SENDCHANGE);
+            snapSuppressed = true;
+            if (Cfg.Verbose) App.Log("     SNAP off (mid-drag)");
+        }
+
+        public static void RestoreSnap()
+        {
+            if (!snapSuppressed) return;
+            snapSuppressed = false;
+            N.EnsureWinArranging();
+            if (Cfg.Verbose) App.Log("     SNAP back on");
+        }
+
         // ---- drag & drop into a zone ---------------------------------------------
         // Is (x,y) off the end of the desktop -- i.e. is this a real OUTER edge of the screen?
         // The border between the ultrawide and the laptop is NOT an edge: you must be able to drag
@@ -1344,6 +1375,10 @@ namespace ZoneMax
                     }
                     else dragUpTicks = 0;
 
+                    // Backstop for drags that end without a WM_LBUTTONUP we saw (Esc, Alt+Tab):
+                    // never leave native Snap suppressed once no drag is running.
+                    if (!Engine.Dragging) Engine.RestoreSnap();
+
                     Engine.DisarmIfDue();
                     if (++tick % 150 == 0) Engine.PruneDeadWindows();   // every ~30s
 
@@ -1609,6 +1644,7 @@ namespace ZoneMax
         IntPtr pressed = IntPtr.Zero;
         N.POINT pressedAt;
         N.RECT pressedRect;      // where the window WAS at press -- a drop only counts if it moved
+        int lastSnapTry;         // throttles mid-drag Snap-suppression retries
 
         IntPtr OnMouse(int nCode, IntPtr wParam, IntPtr lParam)
         {
@@ -1619,9 +1655,9 @@ namespace ZoneMax
                 {
                     int msg = wParam.ToInt32();
 
-                    if (msg == N.WM_LBUTTONDOWN)
+                    if (msg == N.WM_LBUTTONDOWN || msg == N.WM_MBUTTONDOWN
+                        || msg == N.WM_RBUTTONDOWN || msg == N.WM_XBUTTONDOWN)
                     {
-                        pressed = IntPtr.Zero;
                         N.POINT pt;                                   // field reads, not PtrToStructure:
                         pt.X = Marshal.ReadInt32(lParam);             // zero allocation on the hook thread
                         pt.Y = Marshal.ReadInt32(lParam, 4);
@@ -1631,8 +1667,11 @@ namespace ZoneMax
                         // against the CURRENT work area on every mouse activation. Arm the window's
                         // zone now and the re-maximize lands where the window already is. Armed
                         // async (tried once), Chrome wins the race on every click and each click
-                        // visibly bounces the window off the full monitor. Cost here is a handful
-                        // of local user32 calls + cached lookups -- no cross-process messages.
+                        // visibly bounces the window off the full monitor. EVERY button, not just
+                        // left: a middle-click activates the window exactly the same way, and
+                        // arming only for left-clicks left middle-clicks flickering. Cost here is
+                        // a handful of local user32 calls + cached lookups -- no cross-process
+                        // messages.
                         IntPtr root = N.GetAncestor(N.WindowFromPoint(pt), N.GA_ROOT);
                         if (root != IntPtr.Zero && N.IsZoomed(root) && Engine.Manageable(root))
                         {
@@ -1640,8 +1679,26 @@ namespace ZoneMax
                             if (z != null) Engine.ArmFor(root, z, 900);
                         }
 
-                        N.POINT ptCopy = pt;
-                        BeginInvoke(new Action(delegate { Classify(ptCopy); }));
+                        if (msg == N.WM_LBUTTONDOWN)                  // only left starts drags/maximizes
+                        {
+                            pressed = IntPtr.Zero;
+                            N.POINT ptCopy = pt;
+                            BeginInvoke(new Action(delegate { Classify(ptCopy); }));
+                        }
+                    }
+                    else if (msg == N.WM_MOUSEMOVE && Engine.Dragging && !Engine.SnapSuppressed
+                             && pressed != IntPtr.Zero)
+                    {
+                        // The drag-start attempt may have run before Windows restored the window
+                        // (Snap OFF while it's still zoomed would break the restore itself), so
+                        // keep retrying -- throttled -- until the window is restored and Snap is off.
+                        int t = Environment.TickCount;
+                        if (t - lastSnapTry > 60)
+                        {
+                            lastSnapTry = t;
+                            IntPtr dh2 = pressed;
+                            Engine.Post(delegate { Engine.SuppressSnapForDrag(dh2); });
+                        }
                     }
                     else if (msg == N.WM_MOUSEMOVE && pressed != IntPtr.Zero && !Engine.Dragging)
                     {
@@ -1656,6 +1713,7 @@ namespace ZoneMax
                             Engine.Post(delegate
                             {
                                 Engine.Disarm();
+                                Engine.SuppressSnapForDrag(dh);   // native edge-snap out of the way
                                 if (Engine.Cfg.Verbose) App.Log("DRAG start \"" + N.TitleOf(dh) + "\"");
                             });
                         }
@@ -1673,8 +1731,15 @@ namespace ZoneMax
                             drop.X = Marshal.ReadInt32(lParam);
                             drop.Y = Marshal.ReadInt32(lParam, 4);
                             N.RECT startRect = pressedRect;
-                            Engine.Post(delegate { Engine.HandleDrop(dh, drop, startRect); });
+                            Engine.Post(delegate
+                            {
+                                // Place first, THEN hand Snap back: re-enabling before the window's
+                                // move loop has fully wound down could let native snap claim the drop.
+                                Engine.HandleDrop(dh, drop, startRect);
+                                Engine.RestoreSnap();
+                            });
                         }
+                        else if (wasDrag) Engine.Post(delegate { Engine.RestoreSnap(); });
                     }
                 }
                 catch { /* a hook must never throw */ }
