@@ -113,6 +113,8 @@ namespace ZoneMax
         public const int VK_LBUTTON = 0x01;
         public const int VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12;
         public const int VK_LWIN = 0x5B, VK_RWIN = 0x5C;
+        public const int VK_SNAPSHOT = 0x2C;   // PrintScreen
+        public const int VK_S = 0x53;
         public const int VK_NOOP = 0xE8;   // unassigned VK -- injected purely to stop the Start menu opening
 
         public const int GA_ROOT = 2;
@@ -186,6 +188,14 @@ namespace ZoneMax
         [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
         [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, System.Text.StringBuilder sb, int max);
+        public static string ClassOf(IntPtr h)
+        {
+            if (h == IntPtr.Zero) return "(none)";
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(64);
+            GetClassName(h, sb, 64);
+            return sb.ToString();
+        }
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
         [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
@@ -949,17 +959,28 @@ namespace ZoneMax
 
         // Best effort BY DESIGN: called from the mouse hook, so it must never wait on the engine.
         // If Gate is busy the engine is mid-placement anyway and autofix will clean up after it.
-        public static void ArmFor(IntPtr hwnd, Zone z, int ttlMs)
+        public static void ArmFor(IntPtr hwnd, Zone z, int ttlMs) { ArmFor(hwnd, z, ttlMs, false); }
+
+        public static void ArmFor(IntPtr hwnd, Zone z, int ttlMs, bool ignoreShift)
         {
             if (!Cfg.Seamless || Dragging || z == null) return;
-            if ((N.GetAsyncKeyState(N.VK_SHIFT) & 0x8000) != 0) return;    // SHIFT = give me the whole monitor
+            // SHIFT = give me the whole monitor -- except when Shift is part of the combo that got
+            // us here (Win+Shift+S), where it means nothing of the sort.
+            if (!ignoreShift && (N.GetAsyncKeyState(N.VK_SHIFT) & 0x8000) != 0) return;
             if (z.Rect.Area <= 0) return;
 
             N.RECT zr = z.Rect;
             IntPtr mon = N.MonitorFromRect(ref zr, N.MONITOR_DEFAULTTONEAREST);
             if (z.Rect.NearlyEquals(TrueWorkOf(mon), 2)) return;           // zone IS the work area: nothing to arm
 
-            if (!Monitor.TryEnter(Gate, 25)) return;
+            if (!Monitor.TryEnter(Gate, 25))
+            {
+                // The one silent failure that turns into a user-visible explosion: the click goes
+                // through unarmed and Chrome re-maximizes to the full monitor. Log it -- no titles
+                // here (this can run on the hook thread; GetWindowText is a cross-process call).
+                App.Log("     ARM MISSED [" + z.Name + "] -- engine busy; autofix will catch it");
+                return;
+            }
             try
             {
                 if (armedMonitor != IntPtr.Zero && armedMonitor != mon) DisarmLocked();
@@ -1014,7 +1035,11 @@ namespace ZoneMax
         {
             if (snapSuppressed || !Dragging) return;
             if (N.IsZoomed(hwnd)) return;    // restore hasn't happened yet -- Snap still has a job to do
-            N.SpiPtr(N.SPI_SETWINARRANGING, 0, IntPtr.Zero, N.SPIF_SENDCHANGE);
+            // fWinIni = 0, NOT SPIF_SENDCHANGE: the broadcast makes every zoned Chrome re-evaluate
+            // its maximized bounds against the (full) work area -- i.e. every drag would visibly
+            // explode the OTHER maximized windows. The toggle takes effect fine without it (verified
+            // with SPI_GETWINARRANGING).
+            N.SpiPtr(N.SPI_SETWINARRANGING, 0, IntPtr.Zero, 0);
             snapSuppressed = true;
             if (Cfg.Verbose) App.Log("     SNAP off (mid-drag)");
         }
@@ -1023,7 +1048,8 @@ namespace ZoneMax
         {
             if (!snapSuppressed) return;
             snapSuppressed = false;
-            N.EnsureWinArranging();
+            N.SpiPtr(N.SPI_SETWINARRANGING, 1, IntPtr.Zero, 0);   // silent: see SuppressSnapForDrag
+            if (!N.WinArrangingOn()) N.EnsureWinArranging();      // didn't stick -- do it loud
             if (Cfg.Verbose) App.Log("     SNAP back on");
         }
 
@@ -1135,8 +1161,13 @@ namespace ZoneMax
                 return;
             }
 
+            // Attribution: these explosions fire without any click (screenshot overlays, Alt+Tab,
+            // taskbar activation...). Knowing what was foreground at that instant is the only way
+            // to tell WHICH trigger from the log.
+            IntPtr fgNow = N.GetForegroundWindow();
             App.Log("MAX  \"" + N.TitleOf(hwnd) + "\" landed at " + cur
-                    + (fullMonitor ? " (whole monitor)" : " (wrong zone)") + " -- home is [" + home.Name + "]");
+                    + (fullMonitor ? " (whole monitor)" : " (wrong zone)") + " -- home is [" + home.Name + "]"
+                    + "  fg=\"" + N.TitleOf(fgNow) + "\" (" + N.ClassOf(fgNow) + ")");
             // Hold BEFORE posting: LOCATIONCHANGE keeps firing while the fix sits in the queue,
             // and without the hold every one of those events would enqueue a duplicate fix.
             Hold(hwnd, 900);
@@ -1420,6 +1451,26 @@ namespace ZoneMax
 
         protected override void SetVisibleCore(bool value) { base.SetVisibleCore(false); }
 
+        // Diagnostic tap: WM_SETTINGCHANGE / WM_DISPLAYCHANGE broadcasts are what make every
+        // maximized Chrome re-evaluate its bounds at once (the "both windows exploded in the same
+        // second" signature). This window receives the same broadcasts, so the log can name the
+        // culprit -- including ZoneMax itself, whose CaptureTrueWorkAreas broadcasts at startup.
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x001A)        // WM_SETTINGCHANGE
+            {
+                string area = null;
+                try { if (m.LParam != IntPtr.Zero) area = Marshal.PtrToStringUni(m.LParam); } catch { }
+                App.Log("BCAST WM_SETTINGCHANGE wParam=0x" + m.WParam.ToInt64().ToString("X")
+                        + (string.IsNullOrEmpty(area) ? "" : " \"" + area + "\""));
+            }
+            else if (m.Msg == 0x007E)   // WM_DISPLAYCHANGE
+            {
+                App.Log("BCAST WM_DISPLAYCHANGE");
+            }
+            base.WndProc(ref m);
+        }
+
         void LoadEverything()
         {
             Engine.Cfg = Config.Load();
@@ -1702,6 +1753,14 @@ namespace ZoneMax
                     }
                     else if (msg == N.WM_MOUSEMOVE && pressed != IntPtr.Zero && !Engine.Dragging)
                     {
+                        // Stale press guard: if the button-up was never seen by this hook (Esc'd
+                        // drag, hook reinstall mid-gesture), `pressed` survives and every later
+                        // cursor move would fake a drag. The physical button state is the truth.
+                        if ((N.GetAsyncKeyState(N.VK_LBUTTON) & 0x8000) == 0)
+                        {
+                            pressed = IntPtr.Zero;
+                            return N.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                        }
                         int x = Marshal.ReadInt32(lParam), y = Marshal.ReadInt32(lParam, 4);
                         if (Math.Abs(x - pressedAt.X) > 6 || Math.Abs(y - pressedAt.Y) > 6)
                         {
@@ -1798,6 +1857,26 @@ namespace ZoneMax
                         uint flags = (uint)Marshal.ReadInt32(lParam, 8);
                         bool injected = (flags & N.LLKHF_INJECTED) != 0;
                         bool isArrow = vk == N.VK_LEFT || vk == N.VK_RIGHT || vk == N.VK_UP || vk == N.VK_DOWN;
+
+                        // Screenshot combos (Win+Shift+S, PrintScreen) steal the foreground and
+                        // hand it BACK without any click -- and Chrome re-maximizes against the
+                        // CURRENT work area every time it gains foreground (proven with a raw
+                        // SetForegroundWindow repro; clicks are covered by the mouse hook, this
+                        // path was not). Arm the focused window's zone NOW, synchronously, with a
+                        // TTL long enough to survive the whole snip interaction, so the
+                        // focus-return re-maximize lands exactly where the window already is.
+                        if (!injected
+                            && (vk == N.VK_SNAPSHOT
+                                || (vk == N.VK_S && N.WinDown()
+                                    && (N.GetAsyncKeyState(N.VK_SHIFT) & 0x8000) != 0)))
+                        {
+                            IntPtr fgS = N.GetForegroundWindow();
+                            if (fgS != IntPtr.Zero && N.IsZoomed(fgS) && Engine.Manageable(fgS))
+                            {
+                                Zone zS = Engine.ZoneOf(fgS);
+                                if (zS != null) Engine.ArmFor(fgS, zS, 10000, true);
+                            }
+                        }
 
                         if (!injected && isArrow && N.WinDown()
                             && (N.GetAsyncKeyState(N.VK_CONTROL) & 0x8000) == 0
