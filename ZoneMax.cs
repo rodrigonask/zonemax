@@ -496,6 +496,7 @@ namespace ZoneMax
         }
 
         static IntPtr armedMonitor = IntPtr.Zero;
+        static N.RECT armedRect;                   // what the work area is currently armed TO (Gate)
         static int armedUntil = 0;
 
         // TRUE from the moment a title-bar press turns into an actual drag, until the button comes up.
@@ -986,10 +987,19 @@ namespace ZoneMax
             }
             try
             {
+                // Rolling-arm fast path: already armed to exactly this zone -> just extend the TTL.
+                // This is what makes per-KEYSTROKE arming affordable: one SPI call per typing
+                // burst, not one per key, and no log spam.
+                if (armedMonitor == mon && armedRect.NearlyEquals(z.Rect, 0))
+                {
+                    armedUntil = Environment.TickCount + ttlMs;
+                    return;
+                }
                 if (armedMonitor != IntPtr.Zero && armedMonitor != mon) DisarmLocked();
                 N.RECT eff = z.Rect;
                 N.SystemParametersInfo(N.SPI_SETWORKAREA, 0, ref eff, 0);
                 armedMonitor = mon;
+                armedRect = z.Rect;
                 armedUntil = Environment.TickCount + ttlMs;
                 if (Cfg.Verbose) App.Log("     ARM  workarea -> [" + z.Name + "] " + eff + " (" + ttlMs + "ms)");
             }
@@ -1920,7 +1930,7 @@ namespace ZoneMax
         IntPtr OnKey(int nCode, IntPtr wParam, IntPtr lParam)
         {
             lastHookEvent = Environment.TickCount;
-            if (nCode >= 0 && Engine.Cfg.SnapKeys)
+            if (nCode >= 0)
             {
                 try
                 {
@@ -1933,27 +1943,29 @@ namespace ZoneMax
                         bool injected = (flags & N.LLKHF_INJECTED) != 0;
                         bool isArrow = vk == N.VK_LEFT || vk == N.VK_RIGHT || vk == N.VK_UP || vk == N.VK_DOWN;
 
-                        // Screenshot combos (Win+Shift+S, PrintScreen) steal the foreground and
-                        // hand it BACK without any click -- and Chrome re-maximizes against the
-                        // CURRENT work area every time it gains foreground (proven with a raw
-                        // SetForegroundWindow repro; clicks are covered by the mouse hook, this
-                        // path was not). Arm the focused window's zone NOW, synchronously, with a
-                        // TTL long enough to survive the whole snip interaction, so the
-                        // focus-return re-maximize lands exactly where the window already is.
-                        if (!injected
-                            && (vk == N.VK_SNAPSHOT
-                                || (vk == N.VK_S && N.WinDown()
-                                    && (N.GetAsyncKeyState(N.VK_SHIFT) & 0x8000) != 0)))
+                        // Rolling typing arm, on EVERY keydown: apps re-compute their maximized
+                        // bounds at their own leisure while focused -- Slack does it when a sent
+                        // message updates its taskbar badge, i.e. every time you hit Enter. No
+                        // input event "causes" that from our point of view, so the only winning
+                        // move is to keep the work area armed to the focused window's zone for
+                        // the whole typing session. The ArmFor fast path makes this one SPI call
+                        // per burst, not per key. Screenshot combos (Win+Shift+S, PrintScreen)
+                        // get a long TTL instead: the snip steals the foreground and hands it
+                        // back without a click, sometimes many seconds later.
+                        if (!injected)
                         {
-                            IntPtr fgS = N.GetForegroundWindow();
-                            if (fgS != IntPtr.Zero && N.IsZoomed(fgS) && Engine.Manageable(fgS))
+                            bool snip = vk == N.VK_SNAPSHOT
+                                        || (vk == N.VK_S && N.WinDown()
+                                            && (N.GetAsyncKeyState(N.VK_SHIFT) & 0x8000) != 0);
+                            IntPtr fgT = N.GetForegroundWindow();
+                            if (fgT != IntPtr.Zero && N.IsZoomed(fgT) && Engine.Manageable(fgT))
                             {
-                                Zone zS = Engine.ZoneOf(fgS);
-                                if (zS != null) Engine.ArmFor(fgS, zS, 10000, true);
+                                Zone zT = Engine.ZoneOf(fgT);
+                                if (zT != null) Engine.ArmFor(fgT, zT, snip ? 10000 : 1200, true);
                             }
                         }
 
-                        if (!injected && isArrow && N.WinDown()
+                        if (Engine.Cfg.SnapKeys && !injected && isArrow && N.WinDown()
                             && (N.GetAsyncKeyState(N.VK_CONTROL) & 0x8000) == 0
                             && (N.GetAsyncKeyState(N.VK_MENU) & 0x8000) == 0)
                         {
