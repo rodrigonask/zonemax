@@ -945,7 +945,10 @@ namespace ZoneMax
 
         public static void RestoreWindow(IntPtr hwnd)
         {
-            Hold(hwnd, 600);
+            // 4s, not 600ms: this restore is DELIBERATE (Win+Down), and the stray-restore healer
+            // watches a 4s window -- a shorter hold would let it re-maximize what the user just
+            // explicitly un-maximized.
+            Hold(hwnd, 4000);
             N.ShowWindow(hwnd, N.SW_RESTORE);
             App.Log("ACT  restore   \"" + N.TitleOf(hwnd) + "\"");
         }
@@ -1124,14 +1127,39 @@ namespace ZoneMax
         // else, so it can never fight a placement somebody made on purpose:
         //    (a) Windows maximized it across the WHOLE monitor, but its zone is smaller
         //    (b) it landed in a DIFFERENT zone of that monitor than its home
+        // Set by the mouse hook on ANY button-down. Lets keyboard-time checks distinguish "the user
+        // is mousing" from "the user is typing" -- Shift means something during a Shift+click, and
+        // nothing at all during a Shift+Enter.
+        public static volatile int LastClickTick = -1000000;
+
+        // UI-thread only (OnLocationChange): when a managed window we KNOW was zoomed un-zooms
+        // itself with no click, no drag and no Win+Down, that was the APP's doing (Slack/Electron
+        // answers a bounds mismatch by RESTORING instead of re-maximizing like Chrome) -- and it
+        // must be healed, because autofix only ever corrects zoomed windows. State transition, not
+        // a time window: an idle zoomed window fires no events, so any freshness timer expires.
+        static readonly Dictionary<IntPtr, bool> WasZoomed = new Dictionary<IntPtr, bool>();
+        static readonly Dictionary<IntPtr, int> LastHealAt = new Dictionary<IntPtr, int>();
+
         public static void CorrectIfNeeded(IntPtr hwnd)
         {
             if (!Cfg.AutoFix) return;
             if (Dragging) return;                          // hands off: the window is under the cursor right now
-            if (!N.IsZoomed(hwnd)) return;                 // cheapest test first: kills ~99% of events
+            if (!N.IsZoomed(hwnd)) { MaybeHealStrayRestore(hwnd); return; }
+
+            // Record BEFORE the Held bail: the only events an idle window ever fires happen while
+            // our own placement hold is active -- recorded after it, WasZoomed stays false forever
+            // and the stray-restore healer never triggers. Recording state is not correcting.
+            if (WasZoomed.Count > 512) WasZoomed.Clear();           // crude leak cap; resets heal history only
+            WasZoomed[hwnd] = true;
+
             if (Held(hwnd)) return;
             if (!Manageable(hwnd)) return;
-            if ((N.GetAsyncKeyState(N.VK_SHIFT) & 0x8000) != 0) return;
+
+            // SHIFT = "leave it where I put it" -- but only when it accompanies a MOUSE action
+            // (Shift+maximize, Shift+drop). Checked globally, it also fired while TYPING: every
+            // Shift+Enter in Slack was an autofix outage.
+            if ((N.GetAsyncKeyState(N.VK_SHIFT) & 0x8000) != 0
+                && (Environment.TickCount - LastClickTick) < 2000) return;
 
             IntPtr hMon = N.MonitorFromWindow(hwnd, N.MONITOR_DEFAULTTONEAREST);
             List<Zone> zs = ZonesOf(hMon);
@@ -1174,6 +1202,49 @@ namespace ZoneMax
             N.RECT fixRect = home.Rect;
             string fixWhy = "AUTOFIX -> [" + home.Name + "]";
             Post(delegate { MaximizeIntoRect(hwnd, fixRect, fixWhy); });
+        }
+
+        // The Electron counterpart of the whole-monitor explosion. Every guard below exists to
+        // avoid fighting a restore the USER meant: recent click (restore button, taskbar,
+        // double-click caption, drag), Win+Down (RestoreWindow holds the window), minimize
+        // (Win+M/Win+D leaves it iconic), and F11/video fullscreen (rect == whole monitor).
+        static void MaybeHealStrayRestore(IntPtr hwnd)
+        {
+            int now = Environment.TickCount;
+            bool wasZoomed;
+            if (!WasZoomed.TryGetValue(hwnd, out wasZoomed) || !wasZoomed) return;
+            WasZoomed[hwnd] = false;                              // one shot per zoomed episode
+            if (Dragging || Held(hwnd)) return;
+            if ((now - LastClickTick) < 1500) return;             // a click was involved -- probably deliberate
+            if (N.IsIconic(hwnd)) return;                         // minimized, not restored
+            if (!Manageable(hwnd)) return;
+
+            IntPtr hMon = N.MonitorFromWindow(hwnd, N.MONITOR_DEFAULTTONEAREST);
+            Zone home = HomeOf(hwnd, hMon, ZonesOf(hMon));        // remembered home ONLY, no geometry guessing
+            if (home == null)
+            {
+                if (Cfg.Verbose) App.Log("STRAY \"" + N.TitleOf(hwnd) + "\" un-maximized itself but has no remembered home -- leaving it");
+                return;
+            }
+
+            N.RECT cur;
+            if (!N.GetWindowRect(hwnd, out cur)) return;
+            if (cur.NearlyEquals(MonitorRect(hMon), 4)) return;   // borderless fullscreen (F11), not a stray
+
+            int ht;
+            if (LastHealAt.TryGetValue(hwnd, out ht) && (now - ht) < 10000)
+            {
+                App.Log("STRAY \"" + N.TitleOf(hwnd) + "\" un-maximized itself AGAIN within 10s -- it wants this, leaving it");
+                return;
+            }
+            if (LastHealAt.Count > 512) LastHealAt.Clear();
+            LastHealAt[hwnd] = now;
+
+            App.Log("STRAY \"" + N.TitleOf(hwnd) + "\" un-maximized itself (no click/drag) at " + cur
+                    + " -- healing into [" + home.Name + "]");
+            N.RECT r = home.Rect;
+            string why = "HEAL -> [" + home.Name + "]";
+            Post(delegate { MaximizeIntoRect(hwnd, r, why); });
         }
 
         // ---- the keys -------------------------------------------------------------
@@ -1677,7 +1748,10 @@ namespace ZoneMax
                     // visibly explode to the full monitor and get hauled back by autofix ("clicking
                     // anywhere maximizes it"). Arm its own zone briefly so the re-maximize lands
                     // exactly where the window already is -- nothing moves, nothing flickers.
-                    if (z != null && N.IsZoomed(hwnd)) Engine.ArmFor(hwnd, z, 500);
+                    // ignoreShift: this arms the window's OWN zone on focus arrival -- "Shift =
+                    // whole monitor" is click semantics and means nothing here (and the user is
+                    // frequently mid-Shift while typing).
+                    if (z != null && N.IsZoomed(hwnd)) Engine.ArmFor(hwnd, z, 500, true);
                 }
             }
             catch (Exception ex) { App.Log("foreground error: " + ex.Message); }
@@ -1709,6 +1783,7 @@ namespace ZoneMax
                     if (msg == N.WM_LBUTTONDOWN || msg == N.WM_MBUTTONDOWN
                         || msg == N.WM_RBUTTONDOWN || msg == N.WM_XBUTTONDOWN)
                     {
+                        Engine.LastClickTick = Environment.TickCount;
                         N.POINT pt;                                   // field reads, not PtrToStructure:
                         pt.X = Marshal.ReadInt32(lParam);             // zero allocation on the hook thread
                         pt.Y = Marshal.ReadInt32(lParam, 4);
