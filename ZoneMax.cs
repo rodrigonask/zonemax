@@ -2059,28 +2059,30 @@ namespace ZoneMax
                         // back without a click, sometimes many seconds later.
                         if (!injected)
                         {
+                            // Snip / Task View overlays used to get a LONG arm (10s/4s) here. An
+                            // instrumented run killed that idea with two facts: (a) the focused
+                            // window explodes to the full monitor even while its own zone is
+                            // armed -- Chrome's overlay-time re-evaluation ignores the live work
+                            // area for the active window; (b) the SIBLING zoned window
+                            // re-maximizes INTO the armed zone, i.e. the arm teleports innocent
+                            // windows to the wrong zone. A long arm protects nothing and poisons
+                            // everything, so overlay storms belong to autofix (verified
+                            // single-bounce with correct homes). The plain rolling arm stays: its
+                            // job is the focused window's own badge-update re-evaluations
+                            // (Slack on every Enter), which don't touch siblings.
                             bool snip = vk == N.VK_SNAPSHOT
                                         || (vk == N.VK_S && N.WinDown()
                                             && (N.GetAsyncKeyState(N.VK_SHIFT) & 0x8000) != 0);
-                            // Win+Tab = Task View: same beast as the snip overlay (fullscreen
-                            // XamlWindow + programmatic focus handoff), same long arm. Shorter
-                            // TTL though -- Task View can stay open a while, and a stale arm is
-                            // how OTHER windows re-maximize into the wrong zone.
                             bool taskView = vk == N.VK_TAB && N.WinDown();
                             IntPtr fgT = N.GetForegroundWindow();
                             if (fgT != IntPtr.Zero && N.IsZoomed(fgT) && Engine.Manageable(fgT))
                             {
                                 Zone zT = Engine.ZoneOf(fgT);
-                                int ttl = snip ? 10000 : taskView ? 4000 : 1200;
-                                if (zT != null) Engine.ArmFor(fgT, zT, ttl, true);
-                                // Loud on purpose: a snip that arrives some OTHER way (tool hotkey
-                                // that injects, mouse-launched overlay) never reaches this hook, and
-                                // the absence of this line in the log is how we can tell.
-                                if (snip || taskView)
-                                    App.Log((snip ? "SNIP" : "TASKVIEW") + " combo seen (vk=" + vk
-                                            + ") -- armed [" + (zT == null ? "none" : zT.Name)
-                                            + "] for " + ttl + "ms");
+                                if (zT != null) Engine.ArmFor(fgT, zT, 1200, true);
                             }
+                            if (snip || taskView)
+                                App.Log((snip ? "SNIP" : "TASKVIEW") + " combo seen (vk=" + vk
+                                        + ") -- overlay storm expected; autofix sweeps it");
                         }
 
                         if (Engine.Cfg.SnapKeys && !injected && isArrow && N.WinDown()
