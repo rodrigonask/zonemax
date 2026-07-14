@@ -115,6 +115,7 @@ namespace ZoneMax
         public const int VK_LWIN = 0x5B, VK_RWIN = 0x5C;
         public const int VK_SNAPSHOT = 0x2C;   // PrintScreen
         public const int VK_S = 0x53;
+        public const int VK_TAB = 0x09;
         public const int VK_NOOP = 0xE8;   // unassigned VK -- injected purely to stop the Start menu opening
 
         public const int GA_ROOT = 2;
@@ -2061,16 +2062,24 @@ namespace ZoneMax
                             bool snip = vk == N.VK_SNAPSHOT
                                         || (vk == N.VK_S && N.WinDown()
                                             && (N.GetAsyncKeyState(N.VK_SHIFT) & 0x8000) != 0);
+                            // Win+Tab = Task View: same beast as the snip overlay (fullscreen
+                            // XamlWindow + programmatic focus handoff), same long arm. Shorter
+                            // TTL though -- Task View can stay open a while, and a stale arm is
+                            // how OTHER windows re-maximize into the wrong zone.
+                            bool taskView = vk == N.VK_TAB && N.WinDown();
                             IntPtr fgT = N.GetForegroundWindow();
                             if (fgT != IntPtr.Zero && N.IsZoomed(fgT) && Engine.Manageable(fgT))
                             {
                                 Zone zT = Engine.ZoneOf(fgT);
-                                if (zT != null) Engine.ArmFor(fgT, zT, snip ? 10000 : 1200, true);
+                                int ttl = snip ? 10000 : taskView ? 4000 : 1200;
+                                if (zT != null) Engine.ArmFor(fgT, zT, ttl, true);
                                 // Loud on purpose: a snip that arrives some OTHER way (tool hotkey
                                 // that injects, mouse-launched overlay) never reaches this hook, and
                                 // the absence of this line in the log is how we can tell.
-                                if (snip) App.Log("SNIP combo seen (vk=" + vk + ") -- armed ["
-                                                  + (zT == null ? "none" : zT.Name) + "] for 10s");
+                                if (snip || taskView)
+                                    App.Log((snip ? "SNIP" : "TASKVIEW") + " combo seen (vk=" + vk
+                                            + ") -- armed [" + (zT == null ? "none" : zT.Name)
+                                            + "] for " + ttl + "ms");
                             }
                         }
 
