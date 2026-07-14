@@ -505,10 +505,14 @@ namespace ZoneMax
 
         public static Config Cfg = new Config();
 
+        // #1A2B3C after every title: two Chrome windows showing the same page are otherwise
+        // indistinguishable in the log, which made a wrong-zone incident unattributable.
+        public static string Tag(IntPtr h) { return "#" + h.ToInt64().ToString("X"); }
+
         public static string Describe(IntPtr h)
         {
             N.RECT r; N.GetWindowRect(h, out r);
-            return "\"" + N.TitleOf(h) + "\" rect=" + r + " zoomed=" + N.IsZoomed(h);
+            return "\"" + N.TitleOf(h) + "\"" + Tag(h) + " rect=" + r + " zoomed=" + N.IsZoomed(h);
         }
 
         // ---- monitors ------------------------------------------------------------
@@ -778,12 +782,32 @@ namespace ZoneMax
         // window could inherit a dead window's home and get yanked into a zone it never chose.
         public static void RememberHome(IntPtr h, Zone z)
         {
+            string val = null;
+            if (z != null)
+            {
+                uint pid; N.GetWindowThreadProcessId(h, out pid);
+                val = pid.ToString(CultureInfo.InvariantCulture) + "|" + z.MonKey + "|" + z.Name;
+            }
+            string old;
             lock (CacheGate)
             {
-                if (z == null) { Homes.Remove(h.ToInt64()); return; }
-                uint pid; N.GetWindowThreadProcessId(h, out pid);
-                Homes[h.ToInt64()] = pid.ToString(CultureInfo.InvariantCulture) + "|" + z.MonKey + "|" + z.Name;
+                Homes.TryGetValue(h.ToInt64(), out old);
+                if (val == null) Homes.Remove(h.ToInt64()); else Homes[h.ToInt64()] = val;
             }
+            // Every home REWRITE gets a log line -- the one transition the log couldn't show
+            // when autofix hauled a window into a zone the user never chose. Same-value writes
+            // (the overwhelming majority) stay silent. Logged outside the lock: TitleOf can
+            // block on the target window's thread.
+            if (Cfg.Verbose && old != val && (old != null || val != null))
+                App.Log("HOME \"" + N.TitleOf(h) + "\"" + Tag(h) + "  ["
+                        + HomeZoneName(old) + "] -> [" + HomeZoneName(val) + "]");
+        }
+
+        static string HomeZoneName(string v)
+        {
+            if (v == null) return "none";
+            int p = v.LastIndexOf('|');
+            return p < 0 ? v : v.Substring(p + 1);
         }
 
         static Zone HomeOf(IntPtr h, IntPtr hMon, List<Zone> zs)
@@ -840,9 +864,22 @@ namespace ZoneMax
             if (!N.IsZoomed(hwnd))
             {
                 Zone z = Pick(zs, r);          // screen coords -- always trustworthy
-                RememberHome(hwnd, z);
+                // ...but the STATE may be transient: a window mid-explosion sits at its RESTORE
+                // bounds for a few ms (Chrome: restore -> re-maximize; Slack: restore, full stop),
+                // and writing home from that rect teleports it to whatever zone the restore bounds
+                // happen to overlap -- autofix then "corrects" it into a zone the user never chose.
+                // Passive observation only rewrites home once the window has been unzoomed a while;
+                // deliberate placements (keys, drops) write home explicitly and skip this gate.
+                if (RecentlyZoomed(hwnd, 2500))
+                {
+                    if (Cfg.Verbose)
+                        App.Log("HOME skip (unzoomed <2.5s ago) \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd)
+                                + " at " + r + " saw [" + (z == null ? "none" : z.Name) + "]");
+                }
+                else RememberHome(hwnd, z);
                 return z;
             }
+            NoteZoomed(hwnd);
             Zone home = HomeOf(hwnd, hMon, zs);
             if (home != null) return home;
             return Pick(zs, r);
@@ -940,7 +977,7 @@ namespace ZoneMax
                 }
             }
             N.RECT got; N.GetWindowRect(hwnd, out got);
-            App.Log("ACT  " + why + "   \"" + N.TitleOf(hwnd) + "\"");
+            App.Log("ACT  " + why + "   \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd));
             App.Log("       target=" + target + "  ->  RESULT " + got + " zoomed=" + N.IsZoomed(hwnd));
         }
 
@@ -951,7 +988,7 @@ namespace ZoneMax
             // explicitly un-maximized.
             Hold(hwnd, 4000);
             N.ShowWindow(hwnd, N.SW_RESTORE);
-            App.Log("ACT  restore   \"" + N.TitleOf(hwnd) + "\"");
+            App.Log("ACT  restore   \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd));
         }
 
         // ---- arming: momentary, only around a click ------------------------------
@@ -1150,6 +1187,28 @@ namespace ZoneMax
         static readonly Dictionary<IntPtr, bool> WasZoomed = new Dictionary<IntPtr, bool>();
         static readonly Dictionary<IntPtr, int> LastHealAt = new Dictionary<IntPtr, int>();
 
+        // When was this window last SEEN zoomed. Time-based on purpose (unlike WasZoomed, where a
+        // freshness timer was a bug): here a stale entry is the correct answer -- a window that has
+        // been unzoomed for a while SHOULD get passive home updates again. Guards ZoneOf against
+        // recording a mid-explosion restore transient as the window's chosen home.
+        static readonly Dictionary<long, int> LastZoomedTick = new Dictionary<long, int>();
+
+        static void NoteZoomed(IntPtr h)
+        {
+            lock (CacheGate)
+            {
+                if (LastZoomedTick.Count > 512) LastZoomedTick.Clear();
+                LastZoomedTick[h.ToInt64()] = Environment.TickCount;
+            }
+        }
+
+        static bool RecentlyZoomed(IntPtr h, int ms)
+        {
+            int t;
+            lock (CacheGate) { if (!LastZoomedTick.TryGetValue(h.ToInt64(), out t)) return false; }
+            return (Environment.TickCount - t) < ms;   // subtraction: TickCount wraps at ~25 days
+        }
+
         public static void CorrectIfNeeded(IntPtr hwnd)
         {
             if (!Cfg.AutoFix) return;
@@ -1161,6 +1220,7 @@ namespace ZoneMax
             // and the stray-restore healer never triggers. Recording state is not correcting.
             if (WasZoomed.Count > 512) WasZoomed.Clear();           // crude leak cap; resets heal history only
             WasZoomed[hwnd] = true;
+            NoteZoomed(hwnd);
 
             if (Held(hwnd)) return;
             if (!Manageable(hwnd)) return;
@@ -1184,7 +1244,7 @@ namespace ZoneMax
             // window) -- the strings must not even be BUILT unless verbose is on.
             if (cur.NearlyEquals(home.Rect.Inflate(b), 12))
             {
-                if (Cfg.Verbose) App.Log("MAX  correct: [" + home.Name + "] " + cur);
+                if (Cfg.Verbose) App.Log("MAX  correct: [" + home.Name + "] " + cur + " " + Tag(hwnd));
                 return;
             }
 
@@ -1195,7 +1255,7 @@ namespace ZoneMax
 
             if (!fullMonitor && !wrongZone)
             {
-                if (Cfg.Verbose) App.Log("MAX  \"" + N.TitleOf(hwnd) + "\" at " + cur + " -- deliberate, leaving it");
+                if (Cfg.Verbose) App.Log("MAX  \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd) + " at " + cur + " -- deliberate, leaving it");
                 return;
             }
 
@@ -1203,9 +1263,9 @@ namespace ZoneMax
             // taskbar activation...). Knowing what was foreground at that instant is the only way
             // to tell WHICH trigger from the log.
             IntPtr fgNow = N.GetForegroundWindow();
-            App.Log("MAX  \"" + N.TitleOf(hwnd) + "\" landed at " + cur
+            App.Log("MAX  \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd) + " landed at " + cur
                     + (fullMonitor ? " (whole monitor)" : " (wrong zone)") + " -- home is [" + home.Name + "]"
-                    + "  fg=\"" + N.TitleOf(fgNow) + "\" (" + N.ClassOf(fgNow) + ")");
+                    + "  fg=\"" + N.TitleOf(fgNow) + "\"" + Tag(fgNow) + " (" + N.ClassOf(fgNow) + ")");
             // Hold BEFORE posting: LOCATIONCHANGE keeps firing while the fix sits in the queue,
             // and without the hold every one of those events would enqueue a duplicate fix.
             Hold(hwnd, 900);
@@ -1233,7 +1293,7 @@ namespace ZoneMax
             Zone home = HomeOf(hwnd, hMon, ZonesOf(hMon));        // remembered home ONLY, no geometry guessing
             if (home == null)
             {
-                if (Cfg.Verbose) App.Log("STRAY \"" + N.TitleOf(hwnd) + "\" un-maximized itself but has no remembered home -- leaving it");
+                if (Cfg.Verbose) App.Log("STRAY \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd) + " un-maximized itself but has no remembered home -- leaving it");
                 return;
             }
 
@@ -1244,13 +1304,13 @@ namespace ZoneMax
             int ht;
             if (LastHealAt.TryGetValue(hwnd, out ht) && (now - ht) < 10000)
             {
-                App.Log("STRAY \"" + N.TitleOf(hwnd) + "\" un-maximized itself AGAIN within 10s -- it wants this, leaving it");
+                App.Log("STRAY \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd) + " un-maximized itself AGAIN within 10s -- it wants this, leaving it");
                 return;
             }
             if (LastHealAt.Count > 512) LastHealAt.Clear();
             LastHealAt[hwnd] = now;
 
-            App.Log("STRAY \"" + N.TitleOf(hwnd) + "\" un-maximized itself (no click/drag) at " + cur
+            App.Log("STRAY \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd) + " un-maximized itself (no click/drag) at " + cur
                     + " -- healing into [" + home.Name + "]");
             N.RECT r = home.Rect;
             string why = "HEAL -> [" + home.Name + "]";
