@@ -176,6 +176,7 @@ namespace ZoneMax
         public delegate void WinEventProc(IntPtr hook, uint ev, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
         public delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
         public delegate bool MonitorEnumProc(IntPtr hMon, IntPtr hdc, ref RECT r, IntPtr data);
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
@@ -205,6 +206,7 @@ namespace ZoneMax
         [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMon, ref MONITORINFO mi);
         [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern bool GetMonitorInfo(IntPtr hMon, ref MONITORINFOEX mi);
         [DllImport("user32.dll")] public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc cb, IntPtr data);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
         [DllImport("user32.dll", SetLastError = true)] public static extern bool SystemParametersInfo(int a, int u, ref RECT r, int w);
         [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", SetLastError = true)] public static extern bool SpiPtr(int a, int u, IntPtr p, int w);
         [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", SetLastError = true)] public static extern bool SpiInt(int a, int u, ref int p, int w);
@@ -882,7 +884,34 @@ namespace ZoneMax
             NoteZoomed(hwnd);
             Zone home = HomeOf(hwnd, hMon, zs);
             if (home != null) return home;
-            return Pick(zs, r);
+            Zone guess = Pick(zs, r);
+            // Restart/mode-change amnesia: Homes is in-memory, and a monitor mode change kills
+            // the old zone names -- either way a zoomed window can be home-less. If it is sitting
+            // EXACTLY in a zone, that IS its home: learn it. Without this, the window's first
+            // explosion is "corrected" into whichever zone overlaps the whole-monitor rect most
+            // (always the bigger one) -- observed as a window teleporting [Left] -> [Right]
+            // after a screenshot.
+            if (guess != null && r.NearlyEquals(guess.Rect.Inflate(N.Border()), 12))
+                RememberHome(hwnd, guess);
+            return guess;
+        }
+
+        // Homes die with the process. Windows already truly maximized inside a zone when we start
+        // are re-adopted here (ZoneOf's learn-on-sight does the work), so their first explosion
+        // gets corrected into the zone they were actually in -- not a whole-monitor-overlap guess.
+        public static void AdoptExistingWindows()
+        {
+            int adopted = 0;
+            N.EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                try
+                {
+                    if (N.IsZoomed(h) && Manageable(h) && ZoneOf(h) != null) adopted++;
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+            App.Log("adopted " + adopted + " pre-existing zoomed window(s)");
         }
 
         public static bool Manageable(IntPtr hwnd)
@@ -929,6 +958,8 @@ namespace ZoneMax
             if (target.Area <= 0) { App.Log("!! refusing to maximize into empty rect " + target); return; }
             IntPtr hMon = N.MonitorFromRect(ref target, N.MONITOR_DEFAULTTONEAREST);
 
+            for (int attempt = 1; ; attempt++)
+            {
             Hold(hwnd, 900);
             bool shrunkOk = false;
             lock (Gate)
@@ -977,8 +1008,20 @@ namespace ZoneMax
                 }
             }
             N.RECT got; N.GetWindowRect(hwnd, out got);
-            App.Log("ACT  " + why + "   \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd));
+            App.Log("ACT  " + why + "   \"" + N.TitleOf(hwnd) + "\"" + Tag(hwnd)
+                    + (attempt > 1 ? "  (attempt " + attempt + ")" : ""));
             App.Log("       target=" + target + "  ->  RESULT " + got + " zoomed=" + N.IsZoomed(hwnd));
+
+            // A queued re-evaluation inside the target app can fire in the gap between our
+            // work-area restore and the window settling, undoing the fix we JUST made (snip
+            // overlay storms leave several queued: observed AUTOFIX target 1376px -> RESULT
+            // 3456px). One retry consumes it -- otherwise every mass explosion healed in two
+            // or three visible bounces instead of one.
+            if (got.NearlyEquals(target.Inflate(N.Border()), 12)) return;   // landed where asked
+            if (attempt >= 2) return;                                       // twice is enough; autofix owns the rest
+            if (Dragging || !N.IsZoomed(hwnd) || !Manageable(hwnd)) return; // restored itself/gone: the healer's job
+            Thread.Sleep(40);       // let the app's queued re-evaluation land before countering it
+            }
         }
 
         public static void RestoreWindow(IntPtr hwnd)
@@ -1518,6 +1561,7 @@ namespace ZoneMax
 
             BuildTray();
             LoadEverything();
+            Engine.AdoptExistingWindows();
 
             procLoc = OnLocationChange;
             hookLoc = N.SetWinEventHook(N.EVENT_OBJECT_LOCATIONCHANGE, N.EVENT_OBJECT_LOCATIONCHANGE,
@@ -2022,6 +2066,11 @@ namespace ZoneMax
                             {
                                 Zone zT = Engine.ZoneOf(fgT);
                                 if (zT != null) Engine.ArmFor(fgT, zT, snip ? 10000 : 1200, true);
+                                // Loud on purpose: a snip that arrives some OTHER way (tool hotkey
+                                // that injects, mouse-launched overlay) never reaches this hook, and
+                                // the absence of this line in the log is how we can tell.
+                                if (snip) App.Log("SNIP combo seen (vk=" + vk + ") -- armed ["
+                                                  + (zT == null ? "none" : zT.Name) + "] for 10s");
                             }
                         }
 
